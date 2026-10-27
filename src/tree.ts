@@ -8,8 +8,15 @@ export type TreeNode = {
   depth: number;
   color?: string;
   textColor?: string;
+  className?: string;
   rawId?: string;
   metadata?: Record<string, unknown>;
+};
+
+export type LegendGroup = {
+  key: string;
+  label: string;
+  color: string;
 };
 
 export type TreeEdge = {
@@ -178,7 +185,7 @@ const parseEdgeDeclaration = (line: string) => {
   } as const;
 };
 
-const buildTree = (nodes: Map<string, { id: string; label: string; color?: string; textColor?: string }>, edges: TreeEdge[]) => {
+const buildTree = (nodes: Map<string, { id: string; label: string; color?: string; textColor?: string; className?: string }>, edges: TreeEdge[]) => {
   const treeNodes = new Map<string, TreeNode>();
 
   for (const node of nodes.values()) {
@@ -190,6 +197,7 @@ const buildTree = (nodes: Map<string, { id: string; label: string; color?: strin
       depth: 0,
       color: node.color,
       textColor: node.textColor,
+      className: node.className,
       rawId: node.id,
       metadata: {},
     });
@@ -256,7 +264,7 @@ export const parseMermaidTree = (input: string): MermaidTree => {
   }
 
   const lines = getNodeList(input);
-  const nodeMap = new Map<string, { id: string; label: string; color?: string; textColor?: string }>();
+  const nodeMap = new Map<string, { id: string; label: string; color?: string; textColor?: string; className?: string }>();
   const edges: TreeEdge[] = [];
   const classStyles = new Map<string, Record<string, string>>();
   let direction: Direction = 'TB';
@@ -282,6 +290,7 @@ export const parseMermaidTree = (input: string): MermaidTree => {
         const color = styles.color ?? styles['color'];
         current.color = current.color ?? (fill ? String(fill) : undefined);
         current.textColor = current.textColor ?? (color ? String(color) : undefined);
+        current.className = current.className ?? classAssignment.className;
         nodeMap.set(nodeId, current);
       }
       continue;
@@ -319,6 +328,7 @@ export const parseMermaidTree = (input: string): MermaidTree => {
       const color = styles.color ?? styles['color'];
       existing.color = fill ? String(fill) : existing.color;
       existing.textColor = color ? String(color) : existing.textColor;
+      existing.className = existing.className ?? nodeDeclaration.className;
       nodeMap.set(nodeDeclaration.id, existing);
       continue;
     }
@@ -440,6 +450,39 @@ export const getDescendantCounts = (tree: MermaidTree): Map<string, number> => {
   }
 
   return counts;
+};
+
+const DEFAULT_LEGEND_COLOR = '#4f8ef7';
+
+/**
+ * Build a legend from the parsed graph: one entry per distinct node class
+ * (falling back to a generic group for unclassified/custom-styled nodes).
+ */
+export const getLegendGroups = (tree: MermaidTree): LegendGroup[] => {
+  const groups = new Map<string, LegendGroup>();
+
+  for (const node of tree.nodes.values()) {
+    if (node.className) {
+      if (!groups.has(node.className)) {
+        groups.set(node.className, {
+          key: node.className,
+          label: node.className,
+          color: node.color ?? DEFAULT_LEGEND_COLOR,
+        });
+      }
+    } else {
+      const key = `__color__:${node.color ?? DEFAULT_LEGEND_COLOR}`;
+      if (!groups.has(key)) {
+        groups.set(key, {
+          key,
+          label: node.color ? 'Personalizado' : 'Sin clase',
+          color: node.color ?? DEFAULT_LEGEND_COLOR,
+        });
+      }
+    }
+  }
+
+  return Array.from(groups.values());
 };
 
 export const getVisibleNodes = (tree: MermaidTree, expanded: Set<string>) => {

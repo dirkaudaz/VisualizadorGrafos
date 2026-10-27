@@ -4,6 +4,8 @@ import type { MermaidTree, RenderGraph, TreeEdge } from './tree'
 export type TreeCanvasHandle = {
   fitView: () => void
   centerOn: (nodeId: string) => void
+  zoomBy: (factor: number) => void
+  ensureVisible: (nodeId: string) => void
 }
 
 type TreeCanvasProps = {
@@ -18,6 +20,7 @@ type TreeCanvasProps = {
   onSelect: (nodeId: string) => void
   onToggle: (nodeId: string) => void
   onRevealAncestors: (nodeId: string) => void
+  onScaleChange?: (pct: number) => void
 }
 
 type Camera = { scale: number; tx: number; ty: number }
@@ -43,6 +46,7 @@ const TreeCanvas = forwardRef<TreeCanvasHandle, TreeCanvasProps>(function TreeCa
     onSelect,
     onToggle,
     onRevealAncestors,
+    onScaleChange,
   },
   ref,
 ) {
@@ -51,6 +55,7 @@ const TreeCanvas = forwardRef<TreeCanvasHandle, TreeCanvasProps>(function TreeCa
   const frameRef = useRef<number | null>(null)
   const sizeRef = useRef<{ width: number; height: number }>({ width: 0, height: 0 })
   const hitBoxesRef = useRef<Array<{ id: string; x0: number; y0: number; x1: number; y1: number }>>([])
+  const lastReportedScaleRef = useRef<number>(-1)
   const dragRef = useRef<{ active: boolean; moved: boolean; x: number; y: number }>({
     active: false,
     moved: false,
@@ -68,6 +73,7 @@ const TreeCanvas = forwardRef<TreeCanvasHandle, TreeCanvasProps>(function TreeCa
     showNodeLabels,
     showEdgeLabels,
     edgeThickness,
+    onScaleChange,
   })
   stateRef.current = {
     tree,
@@ -78,6 +84,7 @@ const TreeCanvas = forwardRef<TreeCanvasHandle, TreeCanvasProps>(function TreeCa
     showNodeLabels,
     showEdgeLabels,
     edgeThickness,
+    onScaleChange,
   }
 
   const worldBounds = useCallback(() => {
@@ -302,6 +309,12 @@ const TreeCanvas = forwardRef<TreeCanvasHandle, TreeCanvasProps>(function TreeCa
 
     hitBoxesRef.current = hitBoxes
     ctx.restore()
+
+    const pct = Math.round(cam.scale * 100)
+    if (pct !== lastReportedScaleRef.current) {
+      lastReportedScaleRef.current = pct
+      stateRef.current.onScaleChange?.(pct)
+    }
   }, [])
 
   const fitView = useCallback(() => {
@@ -342,7 +355,49 @@ const TreeCanvas = forwardRef<TreeCanvasHandle, TreeCanvasProps>(function TreeCa
     [scheduleDraw],
   )
 
-  useImperativeHandle(ref, () => ({ fitView, centerOn }), [fitView, centerOn])
+  // Pan to a node only when it is outside (or near the edge of) the viewport.
+  const ensureVisible = useCallback(
+    (nodeId: string) => {
+      const pos = stateRef.current.render.positions.get(nodeId)
+      if (!pos) return
+      const { width, height } = sizeRef.current
+      const cam = cameraRef.current
+      const sx = pos.x * cam.scale + cam.tx
+      const sy = pos.y * cam.scale + cam.ty
+      const m = 60
+      if (sx < m || sx > width - m || sy < m || sy > height - m) {
+        cameraRef.current = {
+          scale: cam.scale,
+          tx: width / 2 - pos.x * cam.scale,
+          ty: height / 2 - pos.y * cam.scale,
+        }
+        scheduleDraw()
+      }
+    },
+    [scheduleDraw],
+  )
+
+  const zoomBy = useCallback(
+    (factor: number) => {
+      const { width, height } = sizeRef.current
+      const cam = cameraRef.current
+      const nextScale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, cam.scale * factor))
+      // Zoom around the canvas center.
+      const cx = width / 2
+      const cy = height / 2
+      const worldX = (cx - cam.tx) / cam.scale
+      const worldY = (cy - cam.ty) / cam.scale
+      cameraRef.current = {
+        scale: nextScale,
+        tx: cx - worldX * nextScale,
+        ty: cy - worldY * nextScale,
+      }
+      scheduleDraw()
+    },
+    [scheduleDraw],
+  )
+
+  useImperativeHandle(ref, () => ({ fitView, centerOn, zoomBy, ensureVisible }), [fitView, centerOn, zoomBy, ensureVisible])
 
   // Resize handling.
   useEffect(() => {
