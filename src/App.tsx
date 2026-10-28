@@ -1,5 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import TreeCanvas, { type TreeCanvasHandle } from './TreeCanvas'
+import GraphCanvas, { type GraphCanvasHandle } from './GraphCanvas'
+import {
+  buildCondensedView,
+  buildDiGraph,
+  computeSCCs,
+  findPath,
+  layeredLayout,
+  traceFrom,
+  SAMPLE_NETWORK,
+  type TraceDirection,
+} from './graph'
+import { elkLayout } from './elkLayout'
 import {
   getAncestorPath,
   getDescendantCounts,
@@ -40,10 +52,12 @@ const DEFAULT_MERMAID = `graph LR
 
 const readFileText = async (file: File) => file.text()
 type LayoutDirection = 'LR' | 'TB'
+type ViewMode = 'tree' | 'graph'
 
 function App() {
   const [mermaidText, setMermaidText] = useState(DEFAULT_MERMAID)
   const [fileName, setFileName] = useState<string | null>(null)
+  const [mode, setMode] = useState<ViewMode>('tree')
   const [searchTerm, setSearchTerm] = useState('')
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
@@ -56,7 +70,19 @@ function App() {
   const [zoomPct, setZoomPct] = useState(100)
   const [showShortcuts, setShowShortcuts] = useState(false)
   const [showCode, setShowCode] = useState(false)
+  const [graphFocusId, setGraphFocusId] = useState<string | null>(null)
+  const [traceDir, setTraceDir] = useState<TraceDirection>('both')
+  const [showHops, setShowHops] = useState(true)
+  const [collapseCycles, setCollapseCycles] = useState(false)
+  const [expandedSccs, setExpandedSccs] = useState<Set<number>>(new Set())
+  const [layoutEngine, setLayoutEngine] = useState<'fast' | 'elk'>('fast')
+  const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null)
+  const [pathOrigin, setPathOrigin] = useState<string>('')
+  const [pathDest, setPathDest] = useState<string>('')
+  const [elkResult, setElkResult] = useState<{ positions: Map<string, { x: number; y: number }>; backEdges: Set<string>; layerOf: Map<string, number>; routes: Map<string, Array<{ x: number; y: number }>> } | null>(null)
+  const [elkPending, setElkPending] = useState(false)
   const canvasRef = useRef<TreeCanvasHandle | null>(null)
+  const graphCanvasRef = useRef<GraphCanvasHandle | null>(null)
   const searchInputRef = useRef<HTMLInputElement | null>(null)
   const pendingFitRef = useRef(false)
 
@@ -108,6 +134,209 @@ function App() {
   const visibleCount = visibleGraph.visibleNodes.size
   const hasValidGraph = Boolean(parsedTree.rootId) && !parsedTree.validationError
 
+  // ---- Graph mode (arbitrary directed graphs, cycles allowed) ----
+  const diGraph = useMemo(() => buildDiGraph(mermaidText), [mermaidText])
+  const graphScc = useMemo(() => computeSCCs(diGraph), [diGraph])
+  const cycleCount = useMemo(
+    () => graphScc.components.filter((c) => c.length > 1).length,
+    [graphScc],
+  )
+  const graphHasContent = diGraph.nodes.size > 0 && !diGraph.validationError
+
+  // Pick a sensible default focus (highest total degree) when the graph changes.
+  useEffect(() => {
+    if (!graphHasContent) {
+      setGraphFocusId(null)
+      return
+    }
+    setGraphFocusId((current) => {
+      if (current && diGraph.nodes.has(current)) return current
+      let best: string | null = null
+      let bestDeg = -1
+      for (const id of diGraph.nodes.keys()) {
+        const deg = (diGraph.in.get(id)?.length ?? 0) + (diGraph.out.get(id)?.length ?? 0)
+        if (deg > bestDeg) {
+          bestDeg = deg
+          best = id
+        }
+      }
+      return best
+    })
+  }, [diGraph, graphHasContent])
+
+  const graphTrace = useMemo(
+    () => (graphFocusId && diGraph.nodes.has(graphFocusId) ? traceFrom(diGraph, graphFocusId, traceDir) : null),
+    [diGraph, graphFocusId, traceDir],
+  )
+  const graphNodeSet = useMemo(
+    () => graphTrace?.nodes ?? (graphFocusId ? new Set([graphFocusId]) : new Set<string>()),
+    [graphTrace, graphFocusId],
+  )
+  const graphRoots = useMemo(() => graphTrace?.roots ?? new Set<string>(), [graphTrace])
+
+  // Path finder: shortest directed path origin → destino (if any).
+  const pathResult = useMemo(
+    () => (pathOrigin && pathDest ? findPath(diGraph, pathOrigin, pathDest) : null),
+    [diGraph, pathOrigin, pathDest],
+  )
+
+  // Node set to display: the trace plus any path nodes so the path is visible.
+  const activeNodeSet = useMemo(() => {
+    if (!pathResult) return graphNodeSet
+    const set = new Set(graphNodeSet)
+    for (const id of pathResult.nodes) set.add(id)
+    return set
+  }, [graphNodeSet, pathResult])
+
+  const graphNodeOptions = useMemo(
+    () =>
+      [...diGraph.nodes.values()]
+        .map((n) => ({ id: n.id, label: n.label }))
+        .sort((a, b) => a.label.localeCompare(b.label)),
+    [diGraph],
+  )
+
+  const selectedEdgeLabel = useMemo(() => {
+    if (!selectedEdgeId) return ''
+    const [s, t] = selectedEdgeId.split('->')
+    const name = (id: string) => (id.startsWith('scc:') ? 'Ciclo' : diGraph.nodes.get(id)?.label ?? id)
+    return `${name(s)} → ${name(t)}`
+  }, [selectedEdgeId, diGraph])
+
+  // Reset per-SCC expansion when the graph changes or collapsing is turned off.
+  useEffect(() => {
+    setExpandedSccs(new Set())
+  }, [diGraph, collapseCycles])
+
+  // Clear transient selections/paths when the underlying graph changes.
+  useEffect(() => {
+    setSelectedEdgeId(null)
+    setPathOrigin('')
+    setPathDest('')
+  }, [diGraph])
+
+  // Condense cycles into expandable super-nodes (optional), then lay out.
+  const condensed = useMemo(
+    () => buildCondensedView(diGraph, graphScc, activeNodeSet, collapseCycles, expandedSccs),
+    [diGraph, graphScc, activeNodeSet, collapseCycles, expandedSccs],
+  )
+
+  // Path highlight sets, mapped through the condensation so they stay correct
+  // when cycles are collapsed.
+  const highlightNodes = useMemo(() => {
+    if (!pathResult) return undefined
+    return new Set(pathResult.nodes.map((id) => condensed.renderIdOf(id)))
+  }, [pathResult, condensed])
+  const highlightEdges = useMemo(() => {
+    if (!pathResult) return undefined
+    const set = new Set<string>()
+    const seq = pathResult.nodes
+    for (let i = 0; i < seq.length - 1; i += 1) {
+      const s = condensed.renderIdOf(seq[i])
+      const t = condensed.renderIdOf(seq[i + 1])
+      if (s !== t) set.add(`${s}->${t}`)
+    }
+    return set
+  }, [pathResult, condensed])
+
+  const graphLayout = useMemo(
+    () => layeredLayout(condensed.graph, condensed.nodeSet, layoutDirection),
+    [condensed, layoutDirection],
+  )
+
+  // Optional high-quality layout via ELK (async, off main thread). Falls back
+  // to the fast layout while computing or on error. Back-edge styling reuses
+  // the fast layout's detection.
+  useEffect(() => {
+    if (mode !== 'graph' || layoutEngine !== 'elk' || condensed.nodeSet.size === 0) {
+      setElkResult(null)
+      setElkPending(false)
+      return
+    }
+    let cancelled = false
+    setElkPending(true)
+    elkLayout(condensed.graph, condensed.nodeSet, layoutDirection, graphLayout.backEdges)
+      .then((result) => {
+        if (cancelled) return
+        setElkResult({ positions: result.positions, backEdges: result.backEdges, layerOf: result.layerOf, routes: result.routes })
+        setElkPending(false)
+        requestAnimationFrame(() => graphCanvasRef.current?.fitView())
+      })
+      .catch((error) => {
+        if (cancelled) return
+        console.error('ELK layout failed, using fast layout:', error)
+        setElkResult(null)
+        setElkPending(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [mode, layoutEngine, condensed, layoutDirection, graphLayout])
+
+  const effectiveGraphLayout = layoutEngine === 'elk' && elkResult ? elkResult : graphLayout
+  const graphFocusRenderId = graphFocusId ? condensed.renderIdOf(graphFocusId) : null
+  const graphRootsRender = useMemo(
+    () => new Set([...graphRoots].map((id) => condensed.renderIdOf(id))),
+    [graphRoots, condensed],
+  )
+
+  const handleGraphSelect = (id: string) => {
+    if (id.startsWith('scc:')) {
+      const comp = Number(id.slice(4))
+      setExpandedSccs((previous) => {
+        const next = new Set(previous)
+        next.add(comp)
+        return next
+      })
+      return
+    }
+    setGraphFocusId(id)
+    requestAnimationFrame(() => graphCanvasRef.current?.centerOn(id))
+  }
+
+  const graphLegendGroups = useMemo(() => {
+    const groups = new Map<string, { key: string; label: string; color: string }>()
+    for (const node of diGraph.nodes.values()) {
+      const key = node.className ?? `__color__:${node.color ?? '#4f8ef7'}`
+      if (!groups.has(key)) {
+        groups.set(key, { key, label: node.className ?? (node.color ? 'Personalizado' : 'Sin clase'), color: node.color ?? '#4f8ef7' })
+      }
+    }
+    return [...groups.values()]
+  }, [diGraph])
+
+  const graphSearchResults = useMemo(() => {
+    const q = searchTerm.trim().toLowerCase()
+    if (!q) return [] as Array<{ id: string; label: string }>
+    const out: Array<{ id: string; label: string }> = []
+    for (const node of diGraph.nodes.values()) {
+      if (node.label.toLowerCase().includes(q) || node.id.toLowerCase().includes(q)) {
+        out.push({ id: node.id, label: node.label })
+      }
+      if (out.length >= 20) break
+    }
+    return out
+  }, [diGraph, searchTerm])
+
+  const activeValid = mode === 'tree' ? hasValidGraph : graphHasContent
+
+  // Re-fit the graph view when its structure/orientation changes.
+  useEffect(() => {
+    if (mode !== 'graph') return
+    requestAnimationFrame(() => graphCanvasRef.current?.fitView())
+  }, [effectiveGraphLayout, mode, layoutDirection])
+
+  const handleSelectFocus = (nodeId: string) => {
+    setGraphFocusId(nodeId)
+    requestAnimationFrame(() => graphCanvasRef.current?.centerOn(nodeId))
+  }
+
+  const handleLoadSample = () => {
+    setFileName('red-ejemplo.mmd')
+    setMermaidText(SAMPLE_NETWORK)
+    setMode('graph')
+  }
+
   const handleSearchSelection = (nodeId: string) => {
     setSelectedNodeId(nodeId)
     setExpanded((previous) => revealAncestorsToRoot(parsedTree, nodeId, previous))
@@ -121,12 +350,16 @@ function App() {
     pendingFitRef.current = true
   }
 
-  const handleFit = () => canvasRef.current?.fitView()
+  const handleFit = () => (mode === 'graph' ? graphCanvasRef.current : canvasRef.current)?.fitView()
   const handleCenterOnRoot = () => {
+    if (mode === 'graph') {
+      if (graphFocusId) graphCanvasRef.current?.centerOn(graphFocusId)
+      return
+    }
     if (parsedTree.rootId) canvasRef.current?.centerOn(parsedTree.rootId)
   }
-  const handleZoomIn = () => canvasRef.current?.zoomBy(1.2)
-  const handleZoomOut = () => canvasRef.current?.zoomBy(1 / 1.2)
+  const handleZoomIn = () => (mode === 'graph' ? graphCanvasRef.current : canvasRef.current)?.zoomBy(1.2)
+  const handleZoomOut = () => (mode === 'graph' ? graphCanvasRef.current : canvasRef.current)?.zoomBy(1 / 1.2)
 
   const selectedHasChildren = selectedNode ? selectedNode.children.length > 0 : false
   const selectedExpanded = selectedNodeId ? expanded.has(selectedNodeId) : false
@@ -168,7 +401,31 @@ function App() {
         return
       }
       if (typing || event.metaKey || event.ctrlKey || event.altKey) return
-      if (!parsedTree.rootId) return
+
+      // View shortcuts work in both modes.
+      if (event.key === 'f' || event.key === 'F') {
+        event.preventDefault()
+        ;(mode === 'graph' ? graphCanvasRef.current : canvasRef.current)?.fitView()
+        return
+      }
+      if (event.key === '+' || event.key === '=') {
+        event.preventDefault()
+        ;(mode === 'graph' ? graphCanvasRef.current : canvasRef.current)?.zoomBy(1.2)
+        return
+      }
+      if (event.key === '-' || event.key === '_') {
+        event.preventDefault()
+        ;(mode === 'graph' ? graphCanvasRef.current : canvasRef.current)?.zoomBy(1 / 1.2)
+        return
+      }
+      if (event.key === '?') {
+        event.preventDefault()
+        setShowShortcuts((value) => !value)
+        return
+      }
+
+      // The remaining shortcuts drive tree navigation only.
+      if (mode !== 'tree' || !parsedTree.rootId) return
 
       const order = visibleGraph.order
       const current = selectedNodeId
@@ -176,29 +433,10 @@ function App() {
       const index = current ? order.indexOf(current) : -1
 
       switch (event.key) {
-        case 'f':
-        case 'F':
-          event.preventDefault()
-          canvasRef.current?.fitView()
-          break
         case 'r':
         case 'R':
           event.preventDefault()
           handleResetToRoot()
-          break
-        case '+':
-        case '=':
-          event.preventDefault()
-          canvasRef.current?.zoomBy(1.2)
-          break
-        case '-':
-        case '_':
-          event.preventDefault()
-          canvasRef.current?.zoomBy(1 / 1.2)
-          break
-        case '?':
-          event.preventDefault()
-          setShowShortcuts((value) => !value)
           break
         case 'ArrowDown':
           event.preventDefault()
@@ -247,7 +485,7 @@ function App() {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [parsedTree, visibleGraph, selectedNodeId, expanded])
+  }, [mode, parsedTree, visibleGraph, selectedNodeId, expanded])
 
   const handleLayoutChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
     setLayoutDirection(event.target.value as LayoutDirection)
@@ -271,12 +509,18 @@ function App() {
               {fileName ?? 'Grafo de ejemplo'}
             </span>
           </div>
-          <span className="chip" title="Nodos visibles / totales">
-            {visibleCount.toLocaleString()} / {totalNodes.toLocaleString()}
+          <span className="chip" title={mode === 'graph' ? 'Nodos en análisis / totales' : 'Nodos visibles / totales'}>
+            {(mode === 'graph' ? graphNodeSet.size : visibleCount).toLocaleString()} /{' '}
+            {(mode === 'graph' ? diGraph.nodes.size : totalNodes).toLocaleString()}
           </span>
         </div>
 
-        {parsedTree.validationError ? <div className="error-box">{parsedTree.validationError}</div> : null}
+        {mode === 'tree' && parsedTree.validationError ? (
+          <div className="error-box">{parsedTree.validationError}</div>
+        ) : null}
+        {mode === 'graph' && diGraph.validationError ? (
+          <div className="error-box">{diGraph.validationError}</div>
+        ) : null}
 
         <div className="source-panel">
           <label className="file-picker">
@@ -324,51 +568,250 @@ function App() {
               </div>
               <div>
                 <span>Nodos</span>
-                <strong>{totalNodes.toLocaleString()}</strong>
+                <strong>{(mode === 'graph' ? diGraph.nodes.size : totalNodes).toLocaleString()}</strong>
               </div>
-              <div>
-                <span>Estado</span>
-                <strong className={hasValidGraph ? 'ok' : 'err'}>{hasValidGraph ? 'Árbol válido' : 'No válido'}</strong>
-              </div>
+              {mode === 'graph' ? (
+                <div>
+                  <span>Ciclos</span>
+                  <strong className={cycleCount > 0 ? 'err' : 'ok'}>{cycleCount}</strong>
+                </div>
+              ) : (
+                <div>
+                  <span>Estado</span>
+                  <strong className={hasValidGraph ? 'ok' : 'err'}>{hasValidGraph ? 'Árbol válido' : 'No válido'}</strong>
+                </div>
+              )}
             </div>
           )}
-        </div>
 
-        <div className="field-group search-group">
-          <label htmlFor="search">Buscar por etiqueta</label>
-          <input
-            id="search"
-            ref={searchInputRef}
-            type="text"
-            value={searchTerm}
-            disabled={!hasValidGraph}
-            onChange={(event) => setSearchTerm(event.target.value)}
-            placeholder="Ej: Raíz o Hijo 1  ( / para enfocar )"
-          />
-          <div className="results-box">
-            {searchResults.length === 0 ? (
-              <p className="empty-state">{searchTerm.trim() ? 'Sin resultados' : 'Escribe para buscar nodos'}</p>
-            ) : (
-              <ul>
-                {searchResults.slice(0, 20).map((result) => (
-                  <li key={result.nodeId}>
-                    <button type="button" onClick={() => handleSearchSelection(result.nodeId)}>
-                      <strong>{result.label}</strong>
-                      <span>nivel {result.depth}</span>
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            )}
+          <div className="mode-row">
+            <div className="source-tabs" role="tablist" aria-label="Modo de visualización">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={mode === 'tree'}
+                className={mode === 'tree' ? 'active' : ''}
+                onClick={() => setMode('tree')}
+              >
+                Árbol
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={mode === 'graph'}
+                className={mode === 'graph' ? 'active' : ''}
+                onClick={() => setMode('graph')}
+              >
+                Grafo
+              </button>
+            </div>
+            <button type="button" className="ghost-btn" onClick={handleLoadSample}>
+              Cargar red de ejemplo
+            </button>
           </div>
         </div>
+
+        {mode === 'graph' ? (
+          <div className="field-group search-group">
+            <label htmlFor="search">Nodo foco (origen del análisis)</label>
+            <input
+              id="search"
+              ref={searchInputRef}
+              type="text"
+              value={searchTerm}
+              disabled={!graphHasContent}
+              onChange={(event) => setSearchTerm(event.target.value)}
+              placeholder="Buscar nodo…  ( / para enfocar )"
+            />
+            <div className="results-box">
+              {graphSearchResults.length === 0 ? (
+                <p className="empty-state">
+                  {searchTerm.trim() ? 'Sin resultados' : graphFocusId ? `Foco: ${diGraph.nodes.get(graphFocusId)?.label ?? graphFocusId}` : 'Escribe o haz click en un nodo'}
+                </p>
+              ) : (
+                <ul>
+                  {graphSearchResults.map((result) => (
+                    <li key={result.id}>
+                      <button type="button" onClick={() => handleSelectFocus(result.id)}>
+                        <strong>{result.label}</strong>
+                        <span>{result.id === graphFocusId ? 'foco' : ''}</span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
+        ) : (
+          <div className="field-group search-group">
+            <label htmlFor="search">Buscar por etiqueta</label>
+            <input
+              id="search"
+              ref={searchInputRef}
+              type="text"
+              value={searchTerm}
+              disabled={!hasValidGraph}
+              onChange={(event) => setSearchTerm(event.target.value)}
+              placeholder="Ej: Raíz o Hijo 1  ( / para enfocar )"
+            />
+            <div className="results-box">
+              {searchResults.length === 0 ? (
+                <p className="empty-state">{searchTerm.trim() ? 'Sin resultados' : 'Escribe para buscar nodos'}</p>
+              ) : (
+                <ul>
+                  {searchResults.slice(0, 20).map((result) => (
+                    <li key={result.nodeId}>
+                      <button type="button" onClick={() => handleSearchSelection(result.nodeId)}>
+                        <strong>{result.label}</strong>
+                        <span>nivel {result.depth}</span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
+        )}
+
+        {mode === 'graph' ? (
+          <details className="section" open>
+            <summary>Análisis dirigido</summary>
+            <div className="section-body">
+              <div className="field-group compact-row">
+                <label htmlFor="traceDir">Dirección</label>
+                <select
+                  id="traceDir"
+                  value={traceDir}
+                  disabled={!graphHasContent}
+                  onChange={(event) => setTraceDir(event.target.value as TraceDirection)}
+                >
+                  <option value="upstream">Fuentes (aguas arriba)</option>
+                  <option value="downstream">Impacto (aguas abajo)</option>
+                  <option value="both">Ambos</option>
+                </select>
+              </div>
+              <div className="field-group compact-row">
+                <label htmlFor="layoutEngine">Motor de layout {elkPending ? '· calculando…' : ''}</label>
+                <select
+                  id="layoutEngine"
+                  value={layoutEngine}
+                  disabled={!graphHasContent}
+                  onChange={(event) => setLayoutEngine(event.target.value as 'fast' | 'elk')}
+                >
+                  <option value="fast">Rápido (Sugiyama)</option>
+                  <option value="elk">ELK (alta calidad)</option>
+                </select>
+              </div>
+              <div className="trace-stats">
+                <div>
+                  <span>En análisis</span>
+                  <strong>{graphNodeSet.size}</strong>
+                </div>
+                <div>
+                  <span>{traceDir === 'downstream' ? 'Sumideros' : 'Fuentes raíz'}</span>
+                  <strong>{graphRoots.size}</strong>
+                </div>
+              </div>
+              <label className="checkbox-single">
+                <input type="checkbox" checked={showHops} onChange={(event) => setShowHops(event.target.checked)} />
+                Saltos en cruces de aristas
+              </label>
+              {cycleCount > 0 ? (
+                <label className="checkbox-single">
+                  <input
+                    type="checkbox"
+                    checked={collapseCycles}
+                    onChange={(event) => setCollapseCycles(event.target.checked)}
+                  />
+                  Contraer ciclos ({cycleCount})
+                </label>
+              ) : null}
+              {collapseCycles && condensed.superNodes.size > 0 ? (
+                <p className="hint-text">Click en un nodo ⟳ para expandir el ciclo.</p>
+              ) : null}
+            </div>
+          </details>
+        ) : null}
+
+        {mode === 'graph' ? (
+          <details className="section">
+            <summary>Camino (origen → destino)</summary>
+            <div className="section-body">
+              <div className="field-group compact-row">
+                <label htmlFor="pathOrigin">Origen</label>
+                <select
+                  id="pathOrigin"
+                  value={pathOrigin}
+                  disabled={!graphHasContent}
+                  onChange={(event) => setPathOrigin(event.target.value)}
+                >
+                  <option value="">— elegir —</option>
+                  {graphNodeOptions.map((n) => (
+                    <option key={n.id} value={n.id}>
+                      {n.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="field-group compact-row">
+                <label htmlFor="pathDest">Destino</label>
+                <select
+                  id="pathDest"
+                  value={pathDest}
+                  disabled={!graphHasContent}
+                  onChange={(event) => setPathDest(event.target.value)}
+                >
+                  <option value="">— elegir —</option>
+                  {graphNodeOptions.map((n) => (
+                    <option key={n.id} value={n.id}>
+                      {n.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              {pathOrigin && pathDest ? (
+                pathResult ? (
+                  <p className="path-result ok">
+                    Camino resaltado · {pathResult.nodes.length} nodos, {pathResult.edges.size} aristas
+                  </p>
+                ) : (
+                  <p className="path-result err">No existe un camino dirigido entre esos nodos.</p>
+                )
+              ) : (
+                <p className="hint-text">Elige origen y destino para resaltar el camino.</p>
+              )}
+              {pathOrigin || pathDest ? (
+                <button
+                  type="button"
+                  className="ghost-btn"
+                  onClick={() => {
+                    setPathOrigin('')
+                    setPathDest('')
+                  }}
+                >
+                  Limpiar camino
+                </button>
+              ) : null}
+            </div>
+          </details>
+        ) : null}
+
+        {mode === 'graph' && selectedEdgeId ? (
+          <div className="selected-edge">
+            <span>Arista seleccionada</span>
+            <strong>{selectedEdgeLabel}</strong>
+            <button type="button" onClick={() => setSelectedEdgeId(null)} aria-label="Quitar selección">
+              ✕
+            </button>
+          </div>
+        ) : null}
 
         <details className="section" open>
           <summary>Apariencia</summary>
           <div className="section-body">
             <div className="field-group compact-row">
               <label htmlFor="layout">Orientación</label>
-              <select id="layout" value={layoutDirection} disabled={!hasValidGraph} onChange={handleLayoutChange}>
+              <select id="layout" value={layoutDirection} disabled={!activeValid} onChange={handleLayoutChange}>
                 <option value="LR">Izquierda a derecha</option>
                 <option value="TB">Arriba hacia abajo</option>
               </select>
@@ -384,7 +827,7 @@ function App() {
                   max="6"
                   step="1"
                   value={edgeThickness}
-                  disabled={!hasValidGraph}
+                  disabled={!activeValid}
                   onChange={(event) => setEdgeThickness(Number(event.target.value))}
                 />
                 <span>{edgeThickness}px</span>
@@ -396,7 +839,7 @@ function App() {
                 <input
                   type="checkbox"
                   checked={showNodeLabels}
-                  disabled={!hasValidGraph}
+                  disabled={!activeValid}
                   onChange={(event) => setShowNodeLabels(event.target.checked)}
                 />
                 Mostrar etiquetas de nodos
@@ -405,7 +848,7 @@ function App() {
                 <input
                   type="checkbox"
                   checked={showEdgeLabels}
-                  disabled={!hasValidGraph}
+                  disabled={!activeValid}
                   onChange={(event) => setShowEdgeLabels(event.target.checked)}
                 />
                 Mostrar etiquetas de aristas
@@ -417,9 +860,9 @@ function App() {
 
       <main className="viewer-panel">
         <div className="viewer-wrapper">
-          {hasValidGraph ? (
+          {activeValid ? (
             <>
-              {ancestorPath.length > 1 ? (
+              {mode === 'tree' && ancestorPath.length > 1 ? (
                 <nav className="breadcrumb" aria-label="Camino a la raíz">
                   {ancestorPath.map((nodeId, idx) => {
                     const crumb = parsedTree.nodes.get(nodeId)
@@ -450,7 +893,7 @@ function App() {
                 </div>
                 {showLegend ? (
                   <div className="legend-items">
-                    {legendGroups.map((group) => (
+                    {(mode === 'graph' ? graphLegendGroups : legendGroups).map((group) => (
                       <div className="legend-item" key={group.key}>
                         <span
                           className="legend-swatch"
@@ -459,6 +902,30 @@ function App() {
                         <span>{group.label}</span>
                       </div>
                     ))}
+                    {mode === 'graph' ? (
+                      <>
+                        <div className="legend-item">
+                          <span className="legend-swatch" style={{ background: '#0b1220', borderColor: '#f8fafc' }} />
+                          <span>Nodo foco</span>
+                        </div>
+                        <div className="legend-item">
+                          <span className="legend-swatch" style={{ background: '#0b1220', borderColor: '#f59e0b' }} />
+                          <span>Fuente / raíz</span>
+                        </div>
+                        <div className="legend-item">
+                          <span className="legend-swatch" style={{ background: '#a78bfa', borderColor: '#c4b5fd' }} />
+                          <span>Ciclo contraído (⟳)</span>
+                        </div>
+                        <div className="legend-item">
+                          <span className="legend-swatch edge back" />
+                          <span>Arista inversa (ciclo)</span>
+                        </div>
+                        <div className="legend-item">
+                          <span className="legend-swatch edge" style={{ background: '#38bdf8' }} />
+                          <span>Camino resaltado</span>
+                        </div>
+                      </>
+                    ) : null}
                     <div className="legend-item">
                       <span className="legend-swatch edge" />
                       <span>Arista</span>
@@ -467,55 +934,85 @@ function App() {
                 ) : null}
               </div>
 
-              <TreeCanvas
-                ref={canvasRef}
-                tree={parsedTree}
-                render={visibleGraph}
-                descendantCounts={descendantCounts}
-                selectedNodeId={selectedNodeId}
-                layoutDirection={layoutDirection}
-                showNodeLabels={showNodeLabels}
-                showEdgeLabels={showEdgeLabels}
-                edgeThickness={edgeThickness}
-                onScaleChange={setZoomPct}
-                onSelect={setSelectedNodeId}
-                onToggle={(nodeId) =>
-                  setExpanded((previous) => toggleNodeExpanded(parsedTree, nodeId, previous))
-                }
-                onRevealAncestors={(nodeId) =>
-                  setExpanded((previous) => revealAncestorsToRoot(parsedTree, nodeId, previous))
-                }
-              />
+              {mode === 'graph' ? (
+                <GraphCanvas
+                  ref={graphCanvasRef}
+                  graph={condensed.graph}
+                  nodeSet={condensed.nodeSet}
+                  layout={effectiveGraphLayout}
+                  focusId={graphFocusRenderId}
+                  roots={graphRootsRender}
+                  superNodes={condensed.superNodes}
+                  selectedEdgeId={selectedEdgeId}
+                  highlightEdges={highlightEdges}
+                  highlightNodes={highlightNodes}
+                  showNodeLabels={showNodeLabels}
+                  showEdgeLabels={showEdgeLabels}
+                  showHops={showHops}
+                  edgeThickness={edgeThickness}
+                  onSelect={handleGraphSelect}
+                  onSelectEdge={setSelectedEdgeId}
+                  onScaleChange={setZoomPct}
+                />
+              ) : (
+                <TreeCanvas
+                  ref={canvasRef}
+                  tree={parsedTree}
+                  render={visibleGraph}
+                  descendantCounts={descendantCounts}
+                  selectedNodeId={selectedNodeId}
+                  layoutDirection={layoutDirection}
+                  showNodeLabels={showNodeLabels}
+                  showEdgeLabels={showEdgeLabels}
+                  edgeThickness={edgeThickness}
+                  onScaleChange={setZoomPct}
+                  onSelect={setSelectedNodeId}
+                  onToggle={(nodeId) =>
+                    setExpanded((previous) => toggleNodeExpanded(parsedTree, nodeId, previous))
+                  }
+                  onRevealAncestors={(nodeId) =>
+                    setExpanded((previous) => revealAncestorsToRoot(parsedTree, nodeId, previous))
+                  }
+                />
+              )}
 
-              <div className="canvas-hint">Click: expandir/colapsar · Doble click: camino a la raíz</div>
+              <div className="canvas-hint">
+                {mode === 'graph'
+                  ? 'Click: fijar nodo foco · arrastra para desplazar · rueda para zoom'
+                  : 'Click: expandir/colapsar · Doble click: camino a la raíz'}
+              </div>
 
               <div className="viewer-controls" role="toolbar" aria-label="Controles de vista">
-                <button
-                  type="button"
-                  className="node-action"
-                  title={
-                    selectedNode
-                      ? `${selectedExpanded ? 'Colapsar' : 'Expandir'} hijos de “${selectedNode.label}”`
-                      : 'Expandir / colapsar hijos'
-                  }
-                  aria-label="Expandir o colapsar hijos del nodo seleccionado"
-                  disabled={!selectedHasChildren}
-                  onClick={handleToggleSelectedChildren}
-                >
-                  {selectedExpanded ? '⊟' : '⊞'}
-                </button>
-                <button
-                  type="button"
-                  className="node-action"
-                  title={
-                    selectedNode ? `Expandir ancestros de “${selectedNode.label}”` : 'Expandir ancestros'
-                  }
-                  aria-label="Expandir ancestros del nodo seleccionado hasta la raíz"
-                  onClick={handleRevealSelectedAncestors}
-                >
-                  ⤴
-                </button>
-                <span className="control-divider" />
+                {mode === 'tree' ? (
+                  <>
+                    <button
+                      type="button"
+                      className="node-action"
+                      title={
+                        selectedNode
+                          ? `${selectedExpanded ? 'Colapsar' : 'Expandir'} hijos de “${selectedNode.label}”`
+                          : 'Expandir / colapsar hijos'
+                      }
+                      aria-label="Expandir o colapsar hijos del nodo seleccionado"
+                      disabled={!selectedHasChildren}
+                      onClick={handleToggleSelectedChildren}
+                    >
+                      {selectedExpanded ? '⊟' : '⊞'}
+                    </button>
+                    <button
+                      type="button"
+                      className="node-action"
+                      title={
+                        selectedNode ? `Expandir ancestros de “${selectedNode.label}”` : 'Expandir ancestros'
+                      }
+                      aria-label="Expandir ancestros del nodo seleccionado hasta la raíz"
+                      onClick={handleRevealSelectedAncestors}
+                    >
+                      ⤴
+                    </button>
+                    <span className="control-divider" />
+                  </>
+                ) : null}
                 <button type="button" title="Acercar" aria-label="Acercar" onClick={handleZoomIn}>
                   +
                 </button>

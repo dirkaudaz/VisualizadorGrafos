@@ -252,17 +252,14 @@ const getNodeList = (input: string) => {
   return lines;
 };
 
-export const parseMermaidTree = (input: string): MermaidTree => {
-  if (!input || !input.trim()) {
-    return {
-      rootId: null,
-      nodes: new Map(),
-      edges: [],
-      direction: 'TB',
-      validationError: 'El archivo Mermaid está vacío.',
-    };
-  }
+export type MermaidElements = {
+  nodeMap: Map<string, { id: string; label: string; color?: string; textColor?: string; className?: string }>;
+  edges: TreeEdge[];
+  direction: Direction;
+};
 
+/** Shared Mermaid line parsing used by both the tree and the general-graph builders. */
+export const collectMermaidElements = (input: string): MermaidElements => {
   const lines = getNodeList(input);
   const nodeMap = new Map<string, { id: string; label: string; color?: string; textColor?: string; className?: string }>();
   const edges: TreeEdge[] = [];
@@ -340,6 +337,22 @@ export const parseMermaidTree = (input: string): MermaidTree => {
       continue;
     }
   }
+
+  return { nodeMap, edges, direction };
+};
+
+export const parseMermaidTree = (input: string): MermaidTree => {
+  if (!input || !input.trim()) {
+    return {
+      rootId: null,
+      nodes: new Map(),
+      edges: [],
+      direction: 'TB',
+      validationError: 'El archivo Mermaid está vacío.',
+    };
+  }
+
+  const { nodeMap, edges, direction } = collectMermaidElements(input);
 
   const built = buildTree(nodeMap, edges);
 

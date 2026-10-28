@@ -209,6 +209,124 @@ button {
   color: #f87171;
 }
 
+/* Mode toggle + sample loader */
+.mode-row {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.mode-row .source-tabs {
+  flex: 1;
+}
+
+.ghost-btn {
+  border: 1px solid rgba(96, 165, 250, 0.4);
+  background: rgba(59, 130, 246, 0.12);
+  color: #dbeafe;
+  border-radius: 10px;
+  padding: 7px 10px;
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+
+.ghost-btn:hover {
+  background: rgba(59, 130, 246, 0.24);
+}
+
+/* Directed-analysis section */
+.trace-stats {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.trace-stats > div {
+  background: rgba(15, 23, 42, 0.7);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 10px;
+  padding: 10px;
+}
+
+.trace-stats span {
+  display: block;
+  color: #94a3b8;
+  font-size: 0.7rem;
+  margin-bottom: 3px;
+}
+
+.trace-stats strong {
+  font-size: 1.05rem;
+}
+
+.checkbox-single {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: #dbeafe;
+  font-size: 0.85rem;
+}
+
+.checkbox-single input {
+  accent-color: #60a5fa;
+}
+
+.hint-text {
+  margin: 10px 0 0;
+  color: #94a3b8;
+  font-size: 0.74rem;
+}
+
+.path-result {
+  margin: 8px 0 10px;
+  font-size: 0.8rem;
+}
+
+.path-result.ok {
+  color: #7dd3fc;
+}
+
+.path-result.err {
+  color: #f87171;
+}
+
+.selected-edge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 16px;
+  padding: 10px 12px;
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.7);
+}
+
+.selected-edge span {
+  color: #94a3b8;
+  font-size: 0.72rem;
+}
+
+.selected-edge strong {
+  color: #f8fafc;
+  font-size: 0.82rem;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.selected-edge button {
+  border: none;
+  background: transparent;
+  color: #94a3b8;
+  font-size: 0.8rem;
+}
+
+.legend-swatch.edge.back {
+  background: repeating-linear-gradient(90deg, #f472b6 0 5px, transparent 5px 9px);
+}
+
 /* Disabled controls until a valid tree is loaded */
 input:disabled,
 select:disabled,
